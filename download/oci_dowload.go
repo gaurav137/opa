@@ -10,14 +10,15 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"time"
 
-	"github.com/containerd/containerd/remotes/docker"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
-	"oras.land/oras-go/pkg/content"
-	"oras.land/oras-go/pkg/oras"
+	oras "oras.land/oras-go/v2"
+	"oras.land/oras-go/v2/content/oci"
+	oras_reg "oras.land/oras-go/v2/registry"
+	"oras.land/oras-go/v2/registry/remote"
+	"oras.land/oras-go/v2/registry/remote/auth"
 
 	"github.com/open-policy-agent/opa/bundle"
 	"github.com/open-policy-agent/opa/logging"
@@ -42,13 +43,12 @@ type OCIDownloader struct {
 	mtx            sync.Mutex
 	stopped        bool
 	persist        bool
-	store          *content.OCI
-	etag           string
+	store          *oci.Store
 }
 
 // New returns a new Downloader that can be started.
 func NewOCI(config Config, client rest.Client, path, storePath string) *OCIDownloader {
-	localstore, err := content.NewOCI(storePath)
+	store, err := oci.New(storePath)
 	if err != nil {
 		panic(err)
 	}
@@ -60,7 +60,7 @@ func NewOCI(config Config, client rest.Client, path, storePath string) *OCIDownl
 		trigger:        make(chan chan struct{}),
 		stop:           make(chan chan struct{}),
 		logger:         client.Logger(),
-		store:          localstore,
+		store:          store,
 	}
 }
 
@@ -99,9 +99,8 @@ func (d *OCIDownloader) WithBundlePersistence(persist bool) *OCIDownloader {
 func (d *OCIDownloader) ClearCache() {
 }
 
-// SetCache sets the etag value to the SHA of the loaded bundle
+// TODO: this will need implementation for the OCI downloader.
 func (d *OCIDownloader) SetCache(etag string) {
-	d.etag = etag
 }
 
 // Trigger can be used to control when the downloader attempts to download
@@ -215,7 +214,6 @@ func (d *OCIDownloader) oneShot(ctx context.Context) error {
 		}
 		return err
 	}
-	d.SetCache(resp.etag) // set the current etag sha to the cache
 
 	if d.f != nil {
 		d.f(ctx, Update{ETag: resp.etag, Bundle: resp.b, Error: nil, Metrics: m, Raw: resp.raw})
@@ -226,51 +224,24 @@ func (d *OCIDownloader) oneShot(ctx context.Context) error {
 func (d *OCIDownloader) download(ctx context.Context, m metrics.Metrics) (*downloaderResponse, error) {
 	d.logger.Debug("OCI - Download starting.")
 
-	preferences := []string{fmt.Sprintf("modes=%v,%v", defaultBundleMode, deltaBundleMode)}
-
-	preferValue := fmt.Sprintf("%v", strings.Join(preferences, ";"))
-	d.client = d.client.WithHeader("Prefer", preferValue)
-
+	d.client = d.client.WithHeader("Prefer", fmt.Sprintf("modes=%v,%v", defaultBundleMode, deltaBundleMode))
 	m.Timer(metrics.BundleRequest).Start()
-	_, layers, err := d.pull(ctx, d.path)
+	md, err := d.pull(ctx, d.path)
 	if err != nil {
 		return &downloaderResponse{}, fmt.Errorf("failed to pull %s: %w", d.path, err)
 	}
-	//currently it has 3 as it has the manifest, tar and config layers
-	if len(layers) != 3 {
-		return nil, fmt.Errorf("expected 3 layers only")
-	}
 
-	tarballDescriptor := ocispec.Descriptor{}
-	for i := range layers {
-		if layers[i].MediaType == "application/vnd.oci.image.layer.v1.tar+gzip" {
-			tarballDescriptor = layers[i]
-			break
-		}
-	}
-	if tarballDescriptor.MediaType == "" {
+	if md.MediaType == "application/vnd.oci.image.layer.v1.tar+gzip" {
 		return nil, fmt.Errorf("no tarball descriptor found in the layers")
 	}
-	etag := tarballDescriptor.Digest.Hex()
-	bundleFilePath := filepath.Join(d.localStorePath, "blobs", "sha256", etag)
-	// if the downloader etag sha is the same with digest of the tarball it was already loaded
-	if d.etag == etag {
-		return &downloaderResponse{
-			b:        nil,
-			raw:      nil,
-			etag:     etag,
-			longPoll: false,
-		}, nil
-	}
+
+	bundleFilePath := filepath.Join(d.localStorePath, "blobs", "sha256", string(md.Digest.Hex()))
 	fileReader, err := os.Open(bundleFilePath)
 	if err != nil {
 		return nil, err
 	}
 	loader := bundle.NewTarballLoaderWithBaseURL(fileReader, d.localStorePath)
-	reader := bundle.NewCustomReader(loader).WithBaseDir(d.localStorePath).
-		WithMetrics(m).
-		WithBundleVerificationConfig(d.bvc).
-		WithBundleEtag(etag)
+	reader := bundle.NewCustomReader(loader).WithBaseDir(d.localStorePath)
 	bundleInfo, err := reader.Read()
 	if err != nil {
 		return &downloaderResponse{}, fmt.Errorf("unexpected error %w", err)
@@ -281,94 +252,73 @@ func (d *OCIDownloader) download(ctx context.Context, m metrics.Metrics) (*downl
 	return &downloaderResponse{
 		b:        &bundleInfo,
 		raw:      fileReader,
-		etag:     etag,
+		etag:     "",
 		longPoll: false,
 	}, nil
 }
 
-func (d *OCIDownloader) pull(ctx context.Context, ref string) (*ocispec.Descriptor, []ocispec.Descriptor, error) {
-	authHeader := make(http.Header)
-	client, err := d.getHTTPClient(&authHeader)
+func (d *OCIDownloader) pull(ctx context.Context, ref string) (*ocispec.Descriptor, error) {
+	client, err := d.getHTTPClient()
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	urlInfo, err := url.Parse(d.client.Config().URL)
 	if err != nil {
-		return nil, nil, fmt.Errorf("invalid host url %s: %w", d.client.Config().URL, err)
+		return nil, fmt.Errorf("invalid host url %s: %w", d.client.Config().URL, err)
 	}
-	resolver := docker.NewResolver(docker.ResolverOptions{
-		Hosts:   d.getResolverHost(client, urlInfo),
-		Headers: authHeader,
-	})
 
-	allowedMediaTypes := []string{
-		"application/vnd.oci.image.manifest.v1+json",
-		"application/octet-stream",
-		"application/vnd.oci.image.config.v1+json",
-		"application/vnd.oci.image.layer.v1.tar+gzip",
-	}
-	var layers []ocispec.Descriptor
-	opts := []oras.CopyOpt{
-		oras.WithAllowedMediaTypes(allowedMediaTypes),
-		oras.WithAdditionalCachedMediaTypes(allowedMediaTypes...),
-		oras.WithLayerDescriptors(func(d []ocispec.Descriptor) { layers = d }),
-	}
-	manifestDescriptor, err := oras.Copy(ctx, resolver, ref, d.store, "", opts...)
+	registry := urlInfo.Host
+	reg, err := remote.NewRegistry(registry)
 	if err != nil {
-		return nil, nil, fmt.Errorf("download for '%s' failed: %w", ref, err)
+		return nil, fmt.Errorf("1download for '%s' failed (registry %q): %w", ref, registry, err)
+	}
+	reg.Client = client
+
+	rf, err := oras_reg.ParseReference(ref)
+	if err != nil {
+		return nil, err
 	}
 
-	return &manifestDescriptor, layers, nil
+	src, err := reg.Repository(ctx, rf.Repository)
+	if err != nil {
+		return nil, fmt.Errorf("2download for '%s' failed: %w", ref, err)
+	}
+	manifestDescriptor, err := oras.Copy(ctx, src, ref, d.store, "", oras.DefaultCopyOptions)
+	if err != nil {
+		return nil, fmt.Errorf("3download for '%s' failed: %w rf: %+v", ref, err, rf)
+	}
+
+	return &manifestDescriptor, nil
 }
 
-func (d *OCIDownloader) getResolverHost(client *http.Client, urlInfo *url.URL) docker.RegistryHosts {
-	registryHost := docker.RegistryHost{
-		Host:         urlInfo.Host,
-		Scheme:       urlInfo.Scheme,
-		Capabilities: docker.HostCapabilityPull | docker.HostCapabilityResolve | docker.HostCapabilityPush,
-		Client:       client,
-		Path:         "/v2",
-		Authorizer: docker.NewDockerAuthorizer(
-			docker.WithAuthClient(client),
-			docker.WithAuthCreds(func(string) (string, string, error) {
-				creds := d.client.Config().Credentials
-				if creds.Bearer == nil {
-					return " ", " ", nil
-				}
-
-				return creds.Bearer.Scheme, creds.Bearer.Token, nil
-			})),
-	}
-
-	return func(string) ([]docker.RegistryHost, error) {
-		return []docker.RegistryHost{registryHost}, nil
-	}
-}
-
-func (d *OCIDownloader) getHTTPClient(authHeader *http.Header) (*http.Client, error) {
-	var client *http.Client
-	var err error
+func (d *OCIDownloader) getHTTPClient() (*auth.Client, error) {
 	clientConfig := d.client.Config()
-	if clientConfig != nil && clientConfig.Credentials.ClientTLS != nil {
-		client, err = clientConfig.Credentials.ClientTLS.NewClient(*clientConfig)
+	client := auth.DefaultClient
+	var err error
+
+	switch {
+	case clientConfig == nil: // default client, at the end of this function
+
+	case clientConfig.Credentials.ClientTLS != nil:
+		client.Client, err = clientConfig.Credentials.ClientTLS.NewClient(*clientConfig)
 		if err != nil {
 			return nil, fmt.Errorf("can not create a new client: %w", err)
 		}
-	} else {
-		if clientConfig != nil && clientConfig.Credentials.Bearer != nil {
-			client, err = clientConfig.Credentials.Bearer.NewClient(*clientConfig)
-			if err != nil {
-				return nil, fmt.Errorf("can not create a new bearer client: %w", err)
-			}
+		return client, nil
 
-			authHeader.Add("Authorization",
-				fmt.Sprintf("%s %s",
-					clientConfig.Credentials.Bearer.Scheme,
-					base64.StdEncoding.EncodeToString([]byte(clientConfig.Credentials.Bearer.Token))),
-			)
-		} else {
-			client = &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: clientConfig.AllowInsecureTLS}}}
+	case clientConfig.Credentials.Bearer != nil:
+		client.Client, err = clientConfig.Credentials.Bearer.NewClient(*clientConfig)
+		if err != nil {
+			return nil, fmt.Errorf("can not create a new bearer client: %w", err)
 		}
+
+		client.Header.Add("Authorization", fmt.Sprintf("%s %s",
+			clientConfig.Credentials.Bearer.Scheme,
+			base64.StdEncoding.EncodeToString([]byte(clientConfig.Credentials.Bearer.Token))),
+		)
+		return client, nil
 	}
+
+	client.Client = &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: clientConfig.AllowInsecureTLS}}}
 	return client, nil
 }
